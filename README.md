@@ -1,4 +1,4 @@
-# VitaForge AI — Resume Optimization Platform
+# CVNova — Resume Optimization Platform
 
 An intelligent, AI-powered resume analysis tool that calculates ATS scores, identifies skill gaps, generates career roadmaps, and creates personalized interview questions.
 

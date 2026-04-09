@@ -1,5 +1,5 @@
 """
-VitaForge AI — Optimization Backend
+CVNova — Optimization Backend
 """
 
 import os

@@ -1,5 +1,5 @@
 /**
- * VitaForge AI — Frontend Logic
+ * CVNova — Frontend Logic
  * Handles file upload, API communication, and dashboard rendering.
  */
 

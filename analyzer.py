@@ -1,5 +1,5 @@
 """
-VitaForge AI — Optimization Engine
+CVNova — Optimization Engine
 Rule-based NLP analysis for ATS scoring, skill extraction, and improvement suggestions.
 """
 

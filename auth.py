@@ -104,7 +104,7 @@ def register():
         db.session.commit()
 
         login_user(user, remember=True)
-        flash('Account created successfully! Welcome to VitaForge AI.', 'success')
+        flash('Account created successfully! Welcome to CVNova.', 'success')
         return redirect(url_for('index'))
 
     return render_template('register.html')

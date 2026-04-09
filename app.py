@@ -1,0 +1,599 @@
+"""
+VitaForge AI — Optimization Backend
+"""
+
+import os
+import io
+import json
+import hashlib
+import tempfile
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify, render_template, send_file, redirect, url_for
+from flask_login import LoginManager, login_required, current_user
+from werkzeug.utils import secure_filename
+
+import pdfplumber
+from docx import Document
+import google.generativeai as genai
+import urllib.parse
+import re
+
+from models import db, User
+from analyzer import analyze_resume, get_available_roles
+from pdf_generator import generate_resume_pdf
+from auth import auth, init_oauth
+
+# ─── Load Environment Variables ───────────────────────────────────────────────
+load_dotenv()
+
+# ─── App Setup ────────────────────────────────────────────────────────────────
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-fallback-secret-key')
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB max
+app.config['UPLOAD_FOLDER'] = tempfile.mkdtemp()
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///users.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+import requests
+
+# Initialize AI Clients
+azure_api_key = os.getenv('AZURE_OPENAI_API_KEY')
+azure_endpoint = os.getenv('AZURE_OPENAI_ENDPOINT')
+azure_configured = bool(azure_api_key and azure_endpoint)
+azure_bing_key = os.getenv('AZURE_BING_SEARCH_API_KEY')
+jsearch_api_key = os.getenv('JSEARCH_API_KEY')
+
+github_token = os.getenv('GITHUB_TOKEN')
+github_configured = bool(github_token)
+
+gemini_configured = False
+gemini_api_key = os.getenv('GEMINI_API_KEY')
+print(f"DEBUG: GEMINI_API_KEY present: {bool(gemini_api_key)}, Azure configured: {azure_configured}")
+if gemini_api_key:
+    try:
+        genai.configure(api_key=gemini_api_key)
+        gemini_configured = True
+        print("DEBUG: Gemini SDK configured successfully.")
+    except Exception as e:
+        print(f"DEBUG: Gemini SDK configuration FAILED: {e}")
+        pass
+ALLOWED_EXTENSIONS = {'pdf', 'docx'}
+
+# ─── SHA256 Result Cache ──────────────────────────────────────────────────────
+_result_cache = {}
+
+# ─── Initialize Extensions ───────────────────────────────────────────────────
+db.init_app(app)
+
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'auth.login'
+login_manager.login_message = 'Please log in to access this page.'
+login_manager.login_message_category = 'error'
+
+# Register auth blueprint
+app.register_blueprint(auth)
+
+# Initialize Google OAuth
+google_oauth_configured = bool(os.getenv('GOOGLE_CLIENT_ID', '')) and os.getenv('GOOGLE_CLIENT_ID', '') != 'your-google-client-id'
+init_oauth(app)
+
+@app.context_processor
+def inject_google_oauth():
+    return dict(google_oauth_configured=google_oauth_configured)
+
+# Create database tables
+with app.app_context():
+    db.create_all()
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def extract_text_from_pdf(filepath):
+    """Extract text from PDF using pdfplumber."""
+    text = ""
+    with pdfplumber.open(filepath) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    full_text = text.strip()
+    # Clean PDF artifacts like (cid:127)
+    import re
+    full_text = re.sub(r'\(cid:\d+\)', '', full_text)
+    return full_text.strip()
+
+
+def extract_text_from_docx(filepath):
+    """Extract text from DOCX using python-docx."""
+    doc = Document(filepath)
+    text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+    return text.strip()
+
+
+# ─── Routes ───────────────────────────────────────────────────────────────────
+
+@app.route('/')
+@login_required
+def index():
+    roles = get_available_roles()
+    return render_template('index.html', roles=roles)
+
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    return render_template('dashboard.html')
+
+
+@app.route('/api/roles', methods=['GET'])
+@login_required
+def api_roles():
+    return jsonify(get_available_roles())
+
+
+@app.route('/api/upload', methods=['POST'])
+@login_required
+def upload_resume():
+    # Validate file
+    if 'resume' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    file = request.files['resume']
+    if file.filename == '':
+        return jsonify({"error": "No file selected"}), 400
+
+    if not allowed_file(file.filename):
+        return jsonify({"error": "Invalid file type. Only PDF and DOCX are supported."}), 400
+
+    # Get parameters
+    job_role = request.form.get('job_role', 'software_engineer')
+    job_description = request.form.get('job_description', '')
+    custom_role = request.form.get('custom_role', '')
+
+    # Save and extract text
+    filename = secure_filename(file.filename)
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+
+    try:
+        ext = filename.rsplit('.', 1)[1].lower()
+        if ext == 'pdf':
+            text = extract_text_from_pdf(filepath)
+        elif ext == 'docx':
+            text = extract_text_from_docx(filepath)
+        else:
+            return jsonify({"error": "Unsupported file format"}), 400
+
+        if not text or len(text.strip()) < 50:
+            return jsonify({"error": "Could not extract enough text from the file. Ensure it's not a scanned/image-based PDF."}), 400
+
+        # SHA256 cache: same resume + same role = identical results
+        cache_key = hashlib.sha256((text + job_role + custom_role).encode('utf-8')).hexdigest()
+        if cache_key in _result_cache:
+            cached = _result_cache[cache_key].copy()
+            cached['filename'] = filename
+            cached['cached'] = True
+            return jsonify(cached)
+
+        # Run analysis
+        results = analyze_resume(text, job_role, job_description, custom_role)
+        results['filename'] = filename
+
+        # Store in cache
+        _result_cache[cache_key] = results.copy()
+
+        return jsonify(results)
+
+    except Exception as e:
+        return jsonify({"error": f"Error processing file: {str(e)}"}), 500
+
+    finally:
+        # Clean up uploaded file
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+
+@app.route('/api/download-pdf', methods=['POST'])
+@login_required
+def download_pdf():
+    """Endpoint to generate and download analysis PDF."""
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        pdf_bytes = generate_resume_pdf(data)
+        
+        filename = data.get('filename', 'analysis_report.pdf')
+        if not filename.endswith('.pdf'):
+            filename = f"{filename.split('.')[0]}_report.pdf"
+        else:
+            filename = filename.replace('.pdf', '_report.pdf')
+
+        return send_file(
+            io.BytesIO(pdf_bytes),
+            mimetype='application/pdf',
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        return jsonify({"error": f"Failed to generate PDF: {str(e)}"}), 500
+
+
+@app.route('/api/chat', methods=['POST'])
+@login_required
+def chat():
+    data = request.json
+    if not data or 'message' not in data:
+        return jsonify({"error": "No message provided"}), 400
+    
+    user_msg = data['message']
+    print(f"DEBUG: Incoming /api/chat message: {user_msg}")
+    context = data.get('context', {})
+    
+    # Extract context data for smarter responses
+    role = context.get('role', 'your target role')
+    ats = context.get('ats_score', {})
+    total_score = ats.get('total', 'N/A')
+    missing_skills = context.get('missing_skills', [])
+    found_skills = context.get('found_skills', [])
+    weaknesses = context.get('weaknesses', [])
+    strengths = context.get('strengths', [])
+    roadmap = context.get('roadmap', {}).get('steps', [])
+    interviews = context.get('interview_questions', {}).get('technical', [])
+    jd_match = context.get('jd_match', {})
+    
+    # Check if AI is configured
+    if github_configured or azure_configured or gemini_configured:
+        try:
+            print(f"DEBUG: AI calling with prompt: {user_msg}")
+            # Build a powerful system prompt for Bunny
+            system_prompt = f"""You are Bunny 🐰, an intelligent, friendly, and highly capable AI Resume Companion.
+            
+            YOUR PERSONALITY:
+            - Friendly, supportive, and conversational.
+            - Feel like a real AI mentor, not a rigid bot.
+            - Use emojis thoughtfully but not excessively.
+            - Keep responses concise (2-3 paragraphs max) unless generating specific resume content.
+            
+            YOUR CAPABILITIES:
+            - Understand conversation context and memory.
+            - Handle short intents naturally. If the user says "yes", "sure", or "please", execute the action you previously suggested.
+            - If the user says "no" or "not now", acknowledge gracefully (e.g., "No problem! Let me know if you want to look at something else.")
+            - Proactively offer specific help based on their resume data.
+            - Do NOT repeat the exact same response or phrasing if the user asks a similar question.
+            
+            CANDIDATE'S RESUME CONTEXT:
+            - Target Role: {role}
+            - ATS Score: {total_score}/100
+            - Key Strengths: {', '.join([s.get('title', '') for s in strengths[:3]])}
+            - Weaknesses to Fix: {', '.join([w.get('title', '') for w in weaknesses[:3]])}
+            - Missing Skills: {', '.join(missing_skills[:10]) if missing_skills else 'None detected!'}
+            - Known Skills: {', '.join(found_skills[:15])}
+            
+            INSTRUCTIONS FOR RESPONDING:
+            1. Integrate the candidate's actual resume data into your advice to make it deeply personalized.
+            2. If they ask to improve their resume, generate specific strong bullet points or suggest exactly where to add missing skills.
+            3. Always offer a clear next step or suggestion at the end of your response to keep the conversation dynamic.
+            """
+
+            # If GitHub is configured, prefer it for Bunny chat
+            if github_configured:
+                print("DEBUG: Routing chat to GitHub Models.")
+                messages = [{"role": "system", "content": system_prompt}]
+                
+                # Format history
+                history = data.get('history', [])
+                for msg in history[-10:]:
+                    if msg.get('content'):
+                        in_role = msg.get('role')
+                        msg_role = 'assistant' if in_role == 'assistant' else 'user'
+                        messages.append({"role": msg_role, "content": msg['content']})
+                
+                if not messages or messages[-1].get('content') != user_msg or messages[-1].get('role') != 'user':
+                    messages.append({"role": "user", "content": user_msg})
+                    
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {github_token}"
+                }
+                payload = {
+                    "model": "gpt-4o-mini",
+                    "messages": messages,
+                    "temperature": 0.4,
+                    "max_tokens": 500,
+                    "top_p": 0.9
+                }
+                
+                resp = requests.post("https://models.inference.ai.azure.com/chat/completions", headers=headers, json=payload, timeout=20)
+                resp.raise_for_status()
+                ai_response = resp.json()['choices'][0]['message']['content']
+                print(f"DEBUG: GitHub Models successfully responded: {ai_response[:100]}...")
+                return jsonify({"response": ai_response})
+
+            # Else if Azure is configured
+            elif azure_configured:
+                print("DEBUG: Routing chat to Azure OpenAI.")
+                messages = [{"role": "system", "content": system_prompt}]
+                
+                # Format history for Azure
+                history = data.get('history', [])
+                for msg in history[-10:]:
+                    if msg.get('content'):
+                        in_role = msg.get('role')
+                        msg_role = 'assistant' if in_role == 'assistant' else 'user'
+                        messages.append({"role": msg_role, "content": msg['content']})
+                
+                # Make sure the current user message is always the last one if not already in history
+                if not messages or messages[-1].get('content') != user_msg or messages[-1].get('role') != 'user':
+                    messages.append({"role": "user", "content": user_msg})
+                    
+                headers = {
+                    "Content-Type": "application/json",
+                    "api-key": azure_api_key
+                }
+                payload = {
+                    "messages": messages,
+                    "temperature": 0.4,
+                    "max_tokens": 500,
+                    "top_p": 0.9
+                }
+                
+                resp = requests.post(azure_endpoint, headers=headers, json=payload, timeout=20)
+                resp.raise_for_status()
+                ai_response = resp.json()['choices'][0]['message']['content']
+                print(f"DEBUG: Azure successfully responded: {ai_response[:100]}...")
+                return jsonify({"response": ai_response})
+            else:
+                model = genai.GenerativeModel(
+                    model_name="gemini-1.5-flash",
+                    system_instruction=system_prompt,
+                    generation_config=genai.GenerationConfig(
+                        temperature=0.4,
+                        top_p=0.9,
+                        max_output_tokens=500,
+                    )
+                )
+
+                # history from frontend already includes the current user message as the last item
+                history = data.get('history', [])
+                print(f"DEBUG: History length: {len(history)}")
+                
+                gemini_history = []
+                for msg in history[-10:]:
+                    if msg.get('content'):
+                        role_map = {'user': 'user', 'assistant': 'model'}
+                        g_role = role_map.get(msg.get('role'))
+                        if g_role:
+                            gemini_history.append({"role": g_role, "parts": [msg['content']]})
+
+                latest_user_message = user_msg
+                if gemini_history and gemini_history[-1]['role'] == 'user':
+                    latest_user_message = gemini_history[-1]['parts'][0]
+                    gemini_history = gemini_history[:-1]
+
+                print(f"DEBUG: gemini_history size: {len(gemini_history)}")
+                print(f"DEBUG: latest_user_message: {latest_user_message}")
+
+                chat_session = model.start_chat(history=gemini_history)
+                print("DEBUG: Sending message to Gemini...")
+                response = chat_session.send_message(latest_user_message)
+                
+                ai_response = response.text
+                print(f"DEBUG: Gemini successfully responded: {ai_response[:100]}...")
+                return jsonify({"response": ai_response})
+            
+        except Exception as e:
+            error_str = str(e)
+            print(f"DEBUG ERROR in /api/chat: {error_str}")
+            if "quota" in error_str.lower() or "401" in error_str:
+                return jsonify({
+                    "response": f"I'd love to chat more, but there's a problem with my API Key or quota! 🐰\n\nI can still see your ATS score is **{total_score}**."
+                })
+            elif "429" in error_str or "too many requests" in error_str.lower():
+                return jsonify({
+                    "response": f"Whoops, we're talking a bit too fast and hit a rate limit! (Too Many Requests). 🐰\n\nPlease wait a few seconds and try asking again!"
+                })
+            return jsonify({"error": f"AI service temporarily unavailable. ({error_str})"}), 503
+            
+    # Fallback if AI is not configured
+    return jsonify({
+        "response": f"I'm currently running in offline mode because my API key isn't configured. 🐰\n\nI can still tell you that your ATS score is **{total_score}** and you are targeting a **{role}** role. Connect my API to unlock full conversation capabilities!"
+    })
+
+
+@app.route('/jobs')
+@login_required
+def jobs():
+    return render_template('jobs.html')
+
+
+@app.route('/api/jobs', methods=['GET'])
+@login_required
+def api_jobs():
+    query = request.args.get('q', '')
+    job_type = request.args.get('type', '')
+    location = request.args.get('location', '')
+    skills = request.args.get('skills', '')
+    date_posted = request.args.get('date_posted', 'all')
+    remote_only = request.args.get('remote_only', 'false') == 'true'
+    page = request.args.get('page', '1')
+
+    if not query:
+        return jsonify({"error": "Query parameter 'q' is required"}), 400
+
+    # ─── JSearch API (Primary) ────────────────────────────────────────────
+    if jsearch_api_key:
+        print(f"DEBUG: Using JSearch API for query: {query}")
+
+        # Map UI job type to JSearch employment_types
+        employment_type_map = {
+            'Internship': 'INTERN',
+            'Full-time': 'FULLTIME',
+            'Part-time': 'PARTTIME',
+            'Contract': 'CONTRACTOR',
+        }
+
+        # Build the search query with location baked in
+        search_query = query
+        if location:
+            search_query += f" in {location}"
+
+        headers = {
+            "x-rapidapi-host": "jsearch.p.rapidapi.com",
+            "x-rapidapi-key": jsearch_api_key
+        }
+        params = {
+            "query": search_query,
+            "page": page,
+            "num_pages": "1",
+            "date_posted": date_posted,
+        }
+
+        # Add employment type filter if selected
+        if job_type and job_type in employment_type_map:
+            params["employment_types"] = employment_type_map[job_type]
+
+        if remote_only:
+            params["remote_jobs_only"] = "true"
+
+        try:
+            resp = requests.get(
+                "https://jsearch.p.rapidapi.com/search",
+                headers=headers, params=params, timeout=15
+            )
+            resp.raise_for_status()
+            result = resp.json()
+
+            jobs = []
+            for item in result.get('data', []):
+                # Parse salary info
+                salary = ""
+                min_sal = item.get('job_min_salary')
+                max_sal = item.get('job_max_salary')
+                sal_currency = item.get('job_salary_currency', 'USD')
+                sal_period = item.get('job_salary_period', '')
+                if min_sal and max_sal:
+                    salary = f"{sal_currency} {int(min_sal):,} – {int(max_sal):,}"
+                    if sal_period:
+                        salary += f" / {sal_period.lower()}"
+                elif min_sal:
+                    salary = f"{sal_currency} {int(min_sal):,}+"
+                    if sal_period:
+                        salary += f" / {sal_period.lower()}"
+
+                # Parse location
+                city = item.get('job_city', '')
+                state = item.get('job_state', '')
+                country = item.get('job_country', '')
+                job_location = ', '.join(filter(None, [city, state, country]))
+                if item.get('job_is_remote'):
+                    job_location = f"🌐 Remote" + (f" ({job_location})" if job_location else "")
+                elif not job_location:
+                    job_location = 'Not specified'
+
+                # Parse employment type for display
+                emp_type = item.get('job_employment_type', '')
+                emp_display = {
+                    'FULLTIME': 'Full-time', 'PARTTIME': 'Part-time',
+                    'CONTRACTOR': 'Contract', 'INTERN': 'Internship',
+                    'TEMPORARY': 'Temporary'
+                }.get(emp_type, emp_type.capitalize() if emp_type else '')
+
+                # Extract highlights
+                highlights = item.get('job_highlights', {})
+                qualifications = []
+                responsibilities = []
+                benefits = []
+                if isinstance(highlights, dict):
+                    for h in highlights.get('Qualifications', []):
+                        qualifications.append(h)
+                    for h in highlights.get('Responsibilities', []):
+                        responsibilities.append(h)
+                    for h in highlights.get('Benefits', []):
+                        benefits.append(h)
+
+                # Calculate days ago
+                posted_at = item.get('job_posted_at_datetime_utc', '')
+                days_ago = ''
+                if posted_at:
+                    try:
+                        from datetime import datetime, timezone
+                        posted_dt = datetime.fromisoformat(posted_at.replace('Z', '+00:00'))
+                        diff = datetime.now(timezone.utc) - posted_dt
+                        d = diff.days
+                        if d == 0:
+                            days_ago = 'Today'
+                        elif d == 1:
+                            days_ago = '1 day ago'
+                        else:
+                            days_ago = f'{d} days ago'
+                    except Exception:
+                        days_ago = ''
+
+                # Build description snippet
+                snippet = item.get('job_description', '')[:250]
+                if len(item.get('job_description', '')) > 250:
+                    snippet += '...'
+
+                jobs.append({
+                    "title": item.get('job_title', 'Untitled'),
+                    "company": item.get('employer_name', ''),
+                    "company_logo": item.get('employer_logo', ''),
+                    "location": job_location,
+                    "snippet": snippet,
+                    "url": item.get('job_apply_link') or item.get('job_google_link', '#'),
+                    "source": item.get('job_publisher', 'JSearch'),
+                    "employment_type": emp_display,
+                    "salary": salary,
+                    "posted": days_ago,
+                    "is_remote": item.get('job_is_remote', False),
+                    "qualifications": qualifications[:5],
+                    "responsibilities": responsibilities[:5],
+                    "benefits": benefits[:5],
+                    "ai_recommended": bool(skills)
+                })
+
+            print(f"DEBUG: JSearch returned {len(jobs)} jobs")
+            return jsonify({"jobs": jobs})
+
+        except Exception as e:
+            print(f"DEBUG Error calling JSearch API: {str(e)}")
+            return jsonify({"error": f"Failed to fetch jobs from JSearch: {str(e)}"}), 500
+
+    # ─── Fallback: Mock Data ──────────────────────────────────────────────
+    print("DEBUG: No job search API key found. Using mock data.")
+    mock_jobs = [
+        {
+            "title": f"[Mock] {query}",
+            "company": "Example Corp",
+            "company_logo": "",
+            "location": location or "Remote",
+            "snippet": "Configure your JSEARCH_API_KEY in .env to see real job results from LinkedIn, Indeed, Glassdoor and more.",
+            "url": "https://rapidapi.com/letscrape-6bRBa3QguO5/api/jsearch",
+            "source": "System",
+            "employment_type": job_type or "Full-time",
+            "salary": "",
+            "posted": "Today",
+            "is_remote": False,
+            "qualifications": [],
+            "responsibilities": [],
+            "benefits": [],
+            "ai_recommended": False
+        }
+    ]
+    return jsonify({"jobs": mock_jobs})
+
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=8080)

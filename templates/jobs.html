@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VitaForge AI — Job & Internship Search</title>
+    <meta name="description" content="AI-powered Job, Internship, and Contract Search powered by JSearch.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/auth.css">
+    <link rel="stylesheet" href="/static/jobs.css">
+    <link rel="icon" type="image/svg+xml" href="/static/logo.svg">
+</head>
+<body class="dashboard-body">
+    <!-- Animated background -->
+    <div class="bg-grid"></div>
+    <div class="bg-glow bg-glow-1"></div>
+    <div class="bg-glow bg-glow-2"></div>
+
+    <!-- Header -->
+    <header class="header">
+        <a href="/" class="logo" style="text-decoration:none;">
+            <div class="logo-icon">
+                <img src="/static/app_logo.png" alt="VitaForge AI Logo" width="48" height="48">
+            </div>
+            <span class="logo-text">VitaForge AI</span>
+        </a>
+        <div class="header-user">
+            <a href="/jobs" class="btn-new-analysis" style="background: rgba(187, 134, 252, 0.1); color: #bb86fc; border-color: rgba(187, 134, 252, 0.3);">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                </svg>
+                Find Jobs
+            </a>
+            <a href="/" class="btn-new-analysis">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="12" y1="5" x2="12" y2="19" />
+                    <line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+                New Analysis
+            </a>
+            <div class="user-greeting">
+                <div class="user-avatar">{{ current_user.name[0]|upper }}</div>
+                <span class="user-name">{{ current_user.name }}</span>
+            </div>
+            <a href="/logout" class="btn-logout">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                    <polyline points="16 17 21 12 16 7" />
+                    <line x1="21" y1="12" x2="9" y2="12" />
+                </svg>
+                Logout
+            </a>
+        </div>
+    </header>
+
+    <main class="jobs-container fade-in">
+        <div class="jobs-header glass-card">
+            <h1 class="hero-title" style="margin-bottom: 10px; font-size: 2.2rem;">
+                AI-Powered <span class="gradient-text">Job & Internship Search</span>
+            </h1>
+            <p class="hero-subtitle" style="max-width: 650px; margin: 0 auto 30px; font-size: 1rem;">
+                Search real jobs from LinkedIn, Indeed, Glassdoor & more. Filter by type, date & location — powered by JSearch AI.
+            </p>
+            
+            <form id="jobSearchForm" class="search-form">
+                <div class="search-bar">
+                    <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                    </svg>
+                    <input type="text" id="jobQuery" placeholder="e.g. Python Developer, ML Intern, React Contract" required>
+                    <button type="submit" class="btn-primary btn-search" id="searchBtn">
+                        Search Jobs
+                    </button>
+                </div>
+                
+                <div class="filters-row">
+                    <div class="filter-group">
+                        <label>Job Type</label>
+                        <select id="jobType">
+                            <option value="">Any Type</option>
+                            <option value="Internship">🎓 Internship</option>
+                            <option value="Full-time">💼 Full-time</option>
+                            <option value="Part-time">⏰ Part-time</option>
+                            <option value="Contract">📝 Contract</option>
+                        </select>
+                    </div>
+                    <div class="filter-group">
+                        <label>Location</label>
+                        <input type="text" id="jobLocation" placeholder="e.g. Remote, India, New York">
+                    </div>
+                    <div class="filter-group">
+                        <label>Date Posted</label>
+                        <select id="datePosted">
+                            <option value="all">All Time</option>
+                            <option value="today">Today</option>
+                            <option value="3days">Last 3 Days</option>
+                            <option value="week">This Week</option>
+                            <option value="month">This Month</option>
+                        </select>
+                    </div>
+                    <div class="filter-group">
+                        <label>Remote Only</label>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="remoteOnly">
+                            <span class="toggle-slider"></span>
+                            <span class="toggle-label">Remote</span>
+                        </label>
+                    </div>
+                    <div class="filter-group ai-skills-toggle">
+                        <label>Skill Match</label>
+                        <button type="button" id="useResumeSkillsBtn" class="btn-skills">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
+                            </svg>
+                            Use My Skills
+                        </button>
+                    </div>
+                </div>
+            </form>
+        </div>
+
+        <div id="skillsContext" class="glass-card skills-context" style="display: none;">
+            <p><strong>AI Context Active:</strong> Searching with your resume skills: <span id="skillsList"></span></p>
+        </div>
+
+        <!-- Results Count -->
+        <div id="resultsInfo" class="results-info" style="display: none;">
+            <span id="resultsCount">0</span> jobs found
+            <span id="resultsQuery" class="results-query"></span>
+        </div>
+
+        <div id="jobsLoading" class="loading-state" style="display: none; padding: 60px 0;">
+            <div class="loading-spinner-lg"></div>
+            <h2>Searching real jobs...</h2>
+            <p>Fetching from LinkedIn, Indeed, Glassdoor & more</p>
+        </div>
+
+        <div id="jobsError" class="jobs-error" style="display: none;"></div>
+
+        <div id="jobsResults" class="jobs-grid">
+            <!-- Populated by JS -->
+        </div>
+        
+        <div id="jobsEmpty" class="jobs-empty" style="display: none;">
+            <div style="font-size: 3rem; margin-bottom: 16px;">🔍</div>
+            <h3>No jobs found</h3>
+            <p>Try adjusting your search query, filters, or location.</p>
+        </div>
+    </main>
+
+    <script src="/static/jobs.js"></script>
+</body>
+</html>
